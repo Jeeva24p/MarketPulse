@@ -1,0 +1,17 @@
+marketpulse:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: service-account
+      service_account_file: "{{ env_var('GCP_SA_KEY_PATH', '/tmp/marketpulse-sa.json') }}"
+      project_id: "{{ env_var('GCP_PROJECT_ID', 'your-gcp-project-id') }}"
+      dataset: marketpulse_analytics
+      threads: 4
+    prod:
+      type: bigquery
+      method: service-account
+      service_account_file: "{{ env_var('GCP_SA_KEY_PATH', '/tmp/marketpulse-sa.json') }}"
+      project_id: "{{ env_var('GCP_PROJECT_ID', 'your-gcp-project-id') }}"
+      dataset: marketpulse_analytics
+      threads: 4

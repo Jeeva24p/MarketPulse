@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: marketpulse_raw
+    description: >-
+      Raw OHLCV market data landed by the ingestion pipeline into the
+      BigQuery free-tier sandbox (dataset: marketpulse_raw).
+    database: "{{ env_var('GCP_PROJECT_ID', 'your-gcp-project-id') }}"
+    schema: marketpulse_raw
+    tables:
+      - name: market_ticks
+        description: >-
+          Idempotent raw market ticks, partitioned by trade_date and clustered
+          by ticker. Written via staging LOAD + MERGE upsert from ingestion.

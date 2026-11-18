@@ -1,0 +1,127 @@
+name: MarketPulse CI/CD Pipeline
+
+on:
+  schedule:
+    # Every Monday 02:00 UTC
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marketpulse-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  BIGQUERY_RAW_DATASET: marketpulse_raw
+  BIGQUERY_ANALYTICS_DATASET: marketpulse_analytics
+  TICKERS: AAPL,MSFT,GOOGL,NVDA,SPY,BTC-USD
+
+jobs:
+  quality-gates:
+    name: Quality Gates (pytest + dbt parse)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest unit tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Install dbt
+        run: pip install dbt-core dbt-bigquery
+
+      - name: dbt parse (project syntax validation)
+        run: dbt parse
+        working-directory: dbt
+
+  ingest-and-score:
+    name: Ingest & ML Anomaly Scoring
+    needs: quality-gates
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install dbt-core dbt-bigquery
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Wait for BigQuery sandbox warm-up
+        run: |
+          echo "Sleeping 30s for BigQuery sandbox warm-up..."
+          sleep 30
+
+      - name: Run market data ingestion (idempotent MERGE upsert)
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_RAW_DATASET: ${{ env.BIGQUERY_RAW_DATASET }}
+          BIGQUERY_ANALYTICS_DATASET: ${{ env.BIGQUERY_ANALYTICS_DATASET }}
+          TICKERS: ${{ env.TICKERS }}
+          LOOKBACK_DAYS: "30"
+        run: python -m src.ingestion.fetch_market_data
+
+      - name: Run dbt transformations (staging → marts)
+        run: |
+          dbt deps
+          dbt run
+          dbt test
+        working-directory: dbt
+
+      - name: Run ML anomaly scoring + logging (MLflow + BigQuery MERGE)
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_ANALYTICS_DATASET: ${{ env.BIGQUERY_ANALYTICS_DATASET }}
+          BIGQUERY_ANOMALY_TABLE: ${{ env.BIGQUERY_ANOMALY_TABLE }}
+          MLFLOW_TRACKING_URI: sqlite:///mlruns
+          TICKERS: ${{ env.TICKERS }}
+        run: python -m src.ml.detect_anomalies
+
+      - name: Upload dbt artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-artifacts-${{ github.sha }}
+          path: |
+            dbt/logs/
+            dbt/target/
+          retention-days: 14
+
+  alert-on-failure:
+    name: Critical Failure Webhook Alert
+    runs-on: ubuntu-latest
+    needs: [quality-gates, ingest-and-score]
+    if: failure()
+    steps:
+      - name: Send Discord/Slack alert
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"content\": \"🚨 MarketPulse pipeline **failed** at ${{ github.sha }} — check the [run logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).\"}" \
+            ${{ secrets.ALERT_WEBHOOK_URL }}

@@ -1,0 +1,35 @@
+version: 2
+
+models:
+  - name: dim_assets
+    description: "Gold-layer asset dimension: one row per unique ticker."
+    columns:
+      - name: ticker
+        data_tests:
+          - unique
+          - not_null
+      - name: asset_class
+        data_tests:
+          - not_null
+
+  - name: fact_daily_metrics
+    description: >-
+      Gold-layer daily fact table (grain: ticker + trade_date) enriched with
+      engineered features from the intermediate layer.
+    data_tests:
+      - not_null:
+          arguments:
+            columns:
+              - ticker
+              - trade_date
+              - close_price
+              - volume
+      - relationships:
+          arguments:
+            to: ref('dim_assets')
+            field: ticker
+      - unique:
+          arguments:
+            column_name:
+              - ticker
+              - trade_date
