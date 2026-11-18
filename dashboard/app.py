@@ -10,13 +10,27 @@ Reads gold market data + anomaly scores from BigQuery and renders:
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+# Streamlit puts this script's directory (dashboard/) on sys.path, not the repo
+# root, so add the project root to keep the `src` package importable.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Streamlit does not read .env files, so local runs need the repo-root .env
+# loaded explicitly or credentials/config env vars stay unset (falling back to
+# Application Default Credentials).
+load_dotenv(PROJECT_ROOT / ".env")
 
 from src.utils.logger import get_logger
 
@@ -200,8 +214,17 @@ def main() -> None:
         st.warning("Select at least one ticker from the sidebar to render dashboards.")
         return
 
-    market_df = load_market_data(tuple(selected_tickers))
-    alerts_df = load_alerts(tuple(selected_tickers))
+    try:
+        market_df = load_market_data(tuple(selected_tickers))
+        alerts_df = load_alerts(tuple(selected_tickers))
+    except Exception as exc:  # noqa: BLE001 - surface data/auth failures in the UI
+        logger.exception("BigQuery load failed")
+        st.error(f"Could not load data from BigQuery: {exc}")
+        st.caption(
+            "Check credentials: set GCP_SA_KEY_PATH (or .streamlit/secrets.toml) "
+            "and GCP_PROJECT_ID, or run `gcloud auth application-default login`."
+        )
+        return
 
     chart_ticker = st.selectbox("Chart ticker", options=list(selected_tickers))
 
