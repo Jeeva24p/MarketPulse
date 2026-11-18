@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.sa.json
+secrets/
+mlruns/
+logs/
+*.log
+
+# dbt
+dbt/logs/
+dbt/target/
+dbt/.user.yml
+dbt/dbt_packages/
+
+# BigQuery / local engines
+*.duckdb
+*.sqlite
+*.db
+
+# Streamlit
+.streamlit/secrets.toml
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+!.github/
+!.github/workflows/

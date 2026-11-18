@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
+from google.oauth2 import service_account
 from sklearn.ensemble import IsolationForest
 
 from src.utils.logger import get_logger
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 DEFAULT_CONTAMINATION = 0.05
 DEFAULT_MAX_RISK_SCORE = 100.0
 DEFAULT_MIN_RISK_SCORE = 0.0
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlruns")
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 MLFLOW_MODEL_NAME = "isolation_forest"
 
 GOLD_FEATURE_COLUMNS: list[str] = [
@@ -60,6 +61,22 @@ def normalize_risk_scores(raw_anomaly_scores: np.ndarray) -> np.ndarray:
     return np.clip(normalized, DEFAULT_MIN_RISK_SCORE, DEFAULT_MAX_RISK_SCORE)
 
 
+def _build_bq_client(project_id: str) -> bigquery.Client:
+    """Create a BigQuery client, preferring the configured service-account key.
+
+    Falls back to Application Default Credentials only when no key path is set,
+    which keeps GitHub Actions (keyfile present) and local runs aligned.
+    """
+    key_path = os.getenv("GCP_SA_KEY_PATH")
+    if key_path and os.path.exists(key_path):
+        credentials = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        return bigquery.Client(project=project_id, credentials=credentials)
+    return bigquery.Client(project=project_id)
+
+
 def fetch_gold_features(
     project_id: Optional[str] = None,
     dataset: Optional[str] = None,
@@ -87,12 +104,14 @@ def fetch_gold_features(
             volume_z_score
         FROM `{full_table_id}`
     """
-    params: list = [ticker] if ticker else []
+    params: list = []
     if ticker:
         query += " WHERE ticker = @ticker"
+        params = [bigquery.ScalarQueryParameter("ticker", "STRING", ticker)]
 
-    client = bigquery.Client(project=resolved_project)
-    return client.query(query, params=params).to_dataframe()
+    client = _build_bq_client(resolved_project)
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    return client.query(query, job_config=job_config).to_dataframe()
 
 
 def score_ticker(
@@ -143,37 +162,53 @@ def score_ticker(
     return scored
 
 
-def _build_anomaly_merge_sql(project_id: str, dataset_id: str, table_id: str) -> str:
+def _build_anomaly_upsert_sql(project_id: str, dataset_id: str, table_id: str) -> str:
+    """Idempotent score upsert as DDL (Sandbox rejects DML such as MERGE)."""
     return f"""
-MERGE `{project_id}.{dataset_id}.{table_id}` AS tgt
-USING (
+CREATE OR REPLACE TABLE `{project_id}.{dataset_id}.{table_id}`
+PARTITION BY trade_date
+CLUSTER BY ticker
+AS
+WITH combined AS (
     SELECT
         ticker,
         trade_date,
         risk_score,
         is_anomaly,
-        anomaly_score
+        anomaly_score,
+        0 AS source_rank
     FROM `{project_id}.{dataset_id}.{ANOMALY_STAGING_TABLE}`
-) AS src
-ON tgt.ticker = src.ticker
-   AND tgt.trade_date = src.trade_date
-WHEN MATCHED THEN UPDATE SET
-    risk_score = src.risk_score,
-    is_anomaly = src.is_anomaly,
-    anomaly_score = src.anomaly_score
-WHEN NOT MATCHED THEN INSERT (
+    UNION ALL
+    SELECT
+        ticker,
+        trade_date,
+        risk_score,
+        is_anomaly,
+        anomaly_score,
+        1 AS source_rank
+    FROM `{project_id}.{dataset_id}.{table_id}`
+),
+deduplicated AS (
+    SELECT
+        ticker,
+        trade_date,
+        risk_score,
+        is_anomaly,
+        anomaly_score,
+        ROW_NUMBER() OVER (
+            PARTITION BY ticker, trade_date
+            ORDER BY source_rank ASC
+        ) AS row_num
+    FROM combined
+)
+SELECT
     ticker,
     trade_date,
     risk_score,
     is_anomaly,
     anomaly_score
-) VALUES (
-    src.ticker,
-    src.trade_date,
-    src.risk_score,
-    src.is_anomaly,
-    src.anomaly_score
-)
+FROM deduplicated
+WHERE row_num = 1
 """
 
 
@@ -197,7 +232,7 @@ def upsert_anomaly_scores(
     target_full_table_id = f"{resolved_project}.{resolved_dataset}.{resolved_table}"
     staging_full_table_id = f"{resolved_project}.{resolved_dataset}.{ANOMALY_STAGING_TABLE}"
 
-    client = bigquery.Client(project=resolved_project)
+    client = _build_bq_client(resolved_project)
     _ensure_anomaly_table(client=client, table_id=target_full_table_id, schema=ANOMALY_TABLE_SCHEMA)
 
     if not df.empty:
@@ -211,9 +246,9 @@ def upsert_anomaly_scores(
         )
         load_job.result()
 
-    merge_job = client.query(_build_anomaly_merge_sql(resolved_project, resolved_dataset, resolved_table))
+    merge_job = client.query(_build_anomaly_upsert_sql(resolved_project, resolved_dataset, resolved_table))
     merge_job.result()
-    return int(merge_job.output_rows or 0)
+    return int(df.shape[0])
 
 
 def run_detection(
@@ -226,6 +261,7 @@ def run_detection(
     """Run end-to-end ML detection: read gold features -> score -> alert -> upsert."""
     resolved_project = project_id or os.getenv("GCP_PROJECT_ID")
     resolved_dataset = dataset or os.getenv("BIGQUERY_ANALYTICS_DATASET", "marketpulse_analytics")
+    resolved_table = table or ANOMALY_TABLE
 
     gold_features = fetch_gold_features(
         project_id=resolved_project,

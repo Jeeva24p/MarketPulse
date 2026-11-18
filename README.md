@@ -16,16 +16,16 @@ GitHub Actions Cron (Mon 02:00 UTC)
 │  src/ingestion/      │────▶│  BigQuery        │────▶│  dbt (staging →   │
 │  fetch_market_data. │     │  marketpulse_   │     │  intermediate →    │
 │  (yfinance + BQ     │     │  raw             │     │  marts)            │
-│   MERGE upsert)      │     │  .market_ticks  │     │                     │
+│   DDL upsert)       │     │  .market_ticks  │     │                     │
 └─────────────────────┘     └──────────────────┘     └─────────────────────┘
                                                                  │
                                                                  ▼
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
 │  src/ml/             │────▶│  Gold tables in  │────▶│  fact_anomaly_      │
-│  detect_anomalies.  │     │  marketpulse_    │     │  scores (BQ MERGE)  │
+│  detect_anomalies.  │     │  marketpulse_    │     │  scores (DDL        │
 │  (IsolationForest,  │     │  analytics        │     │                     │
 │   MLflow → SQLite,  │     │                  │     │                     │
-│   BQ MERGE)          │     └──────────────────┘     └─────────────────────┘
+│   BQ DDL upsert)     │     └──────────────────┘     └─────────────────────┘
 └─────────────────────┘              │
         │                          ▼
         ▼                   ┌─────────────────────┐
@@ -35,9 +35,11 @@ GitHub Actions Cron (Mon 02:00 UTC)
                         └─────────────────────┘
 ```
 
-1. **Ingestion** (`src/ingestion/fetch_market_data.py`): `yfinance` OHLCV → normalize → dedup → staging `WRITE_TRUNCATE` → BigQuery **`MERGE`** upsert into `marketpulse_raw.market_ticks`.
+1. **Ingestion** (`src/ingestion/fetch_market_data.py`): `yfinance` OHLCV → normalize → dedup → staging `WRITE_TRUNCATE` → BigQuery **DDL upsert** (`CREATE OR REPLACE TABLE ... AS SELECT`) into `marketpulse_raw.market_ticks`.
 2. **Transformation** (dbt): staging (`stg_market_ticks` – `ROW_NUMBER` dedup) → intermediate (`int_market_features` – 7-day MA, rolling vol, returns, volume z-score) → marts (`dim_assets`, `fact_daily_metrics`).
-3. **ML Detection** (`src/ml/detect_anomalies.py`): IsolationForest per ticker on gold features → normalized risk score (0–100) → MLflow (SQLite) tracking → MERGE into `marketpulse_analytics.fact_anomaly_scores` → critical risk spike alerts.
+3. **ML Detection** (`src/ml/detect_anomalies.py`): IsolationForest per ticker on gold features → normalized risk score (0–100) → MLflow (SQLite) tracking → DDL upsert into `marketpulse_analytics.fact_anomaly_scores` → critical risk spike alerts.
+
+> **Zero-cost constraint:** BigQuery Sandbox rejects all DML (`MERGE`/`INSERT`/`UPDATE`), so upserts are implemented as DDL table rewrites with `ROW_NUMBER()` dedup. This keeps the project fully free-tier compatible.
 4. **Serving** (`dashboard/app.py`): Streamlit + Plotly candlesticks, risk gauges, ticker filters, anomaly alerts feed.
 
 ---
@@ -84,7 +86,7 @@ MarketPulse/
 ├── .github/workflows/pipeline.yml
 ├── src/
 │   ├── utils/            # logger.py (JSON), alerts.py (webhooks)
-│   ├── ingestion/        # fetch_market_data.py (yfinance + MERGE)
+│   ├── ingestion/        # fetch_market_data.py (yfinance + DDL upsert)
 │   └── ml/               # detect_anomalies.py (IsolationForest + MLflow)
 ├── tests/                # pytest suite
 ├── dbt/

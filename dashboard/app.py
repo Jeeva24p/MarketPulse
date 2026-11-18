@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
 from src.utils.logger import get_logger
 
@@ -31,12 +32,39 @@ ALERT_REFRESH_SECONDS: int = 60
 
 def _full_table(dataset: str, table: str) -> str:
     project_id = os.getenv("GCP_PROJECT_ID", "")
+    if not project_id:
+        try:
+            project_id = st.secrets["gcp_service_account"].get("project_id", "")
+        except Exception:  # noqa: BLE001 - secrets are optional outside Streamlit Cloud
+            project_id = ""
     return f"{project_id}.{dataset}.{table}"
 
 
 @st.cache_resource
 def get_bigquery_client():
-    return bigquery.Client()
+    """Build a BigQuery client for Streamlit Cloud (secrets) or local (.env) runs."""
+    project_id = os.getenv("GCP_PROJECT_ID")
+
+    try:
+        service_account_info = st.secrets["gcp_service_account"]
+        project_id = project_id or service_account_info.get("project_id")
+        credentials = service_account.Credentials.from_service_account_info(
+            dict(service_account_info),
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        return bigquery.Client(project=project_id, credentials=credentials)
+    except Exception:  # noqa: BLE001 - secrets are optional outside Streamlit Cloud
+        pass
+
+    key_path = os.getenv("GCP_SA_KEY_PATH")
+    if key_path and os.path.exists(key_path):
+        credentials = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        return bigquery.Client(project=project_id, credentials=credentials)
+
+    return bigquery.Client(project=project_id)
 
 
 @st.cache_data(ttl=CANDLE_REFRESH_SECONDS)
@@ -49,7 +77,10 @@ def load_market_data(tickers: tuple) -> pd.DataFrame:
     dataset = os.getenv("BIGQUERY_ANALYTICS_DATASET", "marketpulse_analytics")
     full_table = _full_table(dataset, os.getenv("BIGQUERY_GOLD_TABLE", DEFAULT_GOLD_TABLE))
     placeholders = ", ".join([f"@ticker_{idx}" for idx in range(len(tickers))])
-    params = {f"ticker_{idx}": ticker for idx, ticker in enumerate(tickers)}
+    query_params = [
+        bigquery.ScalarQueryParameter(f"ticker_{idx}", "STRING", ticker)
+        for idx, ticker in enumerate(tickers)
+    ]
     query = f"""
         SELECT
             ticker,
@@ -67,7 +98,8 @@ def load_market_data(tickers: tuple) -> pd.DataFrame:
         WHERE ticker IN ({placeholders})
         ORDER BY ticker, trade_date
     """
-    return client.query(query, params=params).to_dataframe()
+    job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+    return client.query(query, job_config=job_config).to_dataframe()
 
 
 @st.cache_data(ttl=ALERT_REFRESH_SECONDS)
@@ -80,7 +112,11 @@ def load_alerts(tickers: tuple) -> pd.DataFrame:
     dataset = os.getenv("BIGQUERY_ANALYTICS_DATASET", "marketpulse_analytics")
     full_table = _full_table(dataset, os.getenv("BIGQUERY_ANOMALY_TABLE", DEFAULT_ANOMALY_TABLE))
     placeholders = ", ".join([f"@ticker_{idx}" for idx in range(len(tickers))])
-    params = {f"ticker_{idx}": ticker for idx, ticker in enumerate(tickers)}
+    query_params = [
+        bigquery.ScalarQueryParameter(f"ticker_{idx}", "STRING", ticker)
+        for idx, ticker in enumerate(tickers)
+    ]
+    query_params.append(bigquery.ScalarQueryParameter("risk_threshold", "FLOAT64", RISK_SCORE_HIGH))
     query = f"""
         SELECT
             ticker,
@@ -93,8 +129,8 @@ def load_alerts(tickers: tuple) -> pd.DataFrame:
           AND ticker IN ({placeholders})
         ORDER BY risk_score DESC
     """
-    params["risk_threshold"] = RISK_SCORE_HIGH
-    return client.query(query, params=params).to_dataframe()
+    job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+    return client.query(query, job_config=job_config).to_dataframe()
 
 
 def render_candlestick_chart(df: pd.DataFrame):
@@ -124,11 +160,15 @@ def render_risk_gauge(risk_score: float) -> go.Figure:
     gauge = go.Figure(
         data=[
             go.Indicator(
-                type="gauge",
-                progressBar={"visible": True, "width": 12},
+                mode="gauge+number",
                 gauge={
                     "axis": {"range": [0, 100]},
                     "bar": {"thickness": 0.3},
+                    "threshold": {
+                        "line": {"color": "red", "width": 3},
+                        "thickness": 0.75,
+                        "value": RISK_SCORE_HIGH,
+                    },
                 },
                 value=float(risk_score),
             )

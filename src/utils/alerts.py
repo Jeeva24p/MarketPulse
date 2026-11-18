@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -16,9 +17,9 @@ DEFAULT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 RISK_SCORE_HIGH = float(os.getenv("RISK_SCORE_HIGH", "85"))
 
 SEVERITY_TO_LOG_LEVEL = {
-    "INFO": "INFO",
-    "WARNING": "WARNING",
-    "CRITICAL": "CRITICAL",
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "CRITICAL": logging.CRITICAL,
 }
 
 

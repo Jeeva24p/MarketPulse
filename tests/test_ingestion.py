@@ -81,7 +81,7 @@ class TestFetch:
 
 class TestBigQueryUpsert:
     @patch("src.ingestion.fetch_market_data.bigquery.Client")
-    def test_upsert_market_ticks_runs_merge_upsert(self, mock_client_cls):
+    def test_upsert_market_ticks_runs_ddl_upsert(self, mock_client_cls):
         client = MagicMock()
         mock_client_cls.return_value = client
 
@@ -91,10 +91,11 @@ class TestBigQueryUpsert:
         client.load_table_from_dataframe.assert_called_once()
         client.query.assert_called_once()
 
-        merge_sql = client.query.call_args.args[0]
-        assert merge_sql.lstrip().upper().startswith("MERGE")
-        assert "market_ticks_staging" in merge_sql
-        assert "WHEN NOT MATCHED THEN INSERT" in merge_sql
+        upsert_sql = client.query.call_args.args[0]
+        assert upsert_sql.lstrip().upper().startswith("CREATE OR REPLACE TABLE")
+        assert "market_ticks_staging" in upsert_sql
+        assert "ROW_NUMBER()" in upsert_sql
+        assert rows == len(_normalized_frame())
 
     @patch("src.ingestion.fetch_market_data.bigquery.Client")
     def test_upsert_market_ticks_uses_raw_table_id(self, mock_client_cls):

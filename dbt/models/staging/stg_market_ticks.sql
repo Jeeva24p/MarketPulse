@@ -1,5 +1,3 @@
-{{ source('marketpulse_raw', 'market_ticks') }}
-
 SELECT
     CAST(ticker AS STRING) AS ticker,
     CAST(trade_date AS DATE) AS trade_date,

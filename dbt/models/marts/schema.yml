@@ -17,19 +17,21 @@ models:
       Gold-layer daily fact table (grain: ticker + trade_date) enriched with
       engineered features from the intermediate layer.
     data_tests:
-      - not_null:
-          arguments:
-            columns:
-              - ticker
-              - trade_date
-              - close_price
-              - volume
       - relationships:
           arguments:
+            column_name: ticker
             to: ref('dim_assets')
             field: ticker
-      - unique:
-          arguments:
-            column_name:
-              - ticker
-              - trade_date
+    columns:
+      - name: ticker
+        data_tests:
+          - not_null
+      - name: trade_date
+        data_tests:
+          - not_null
+      - name: close_price
+        data_tests:
+          - not_null
+      - name: volume
+        data_tests:
+          - not_null

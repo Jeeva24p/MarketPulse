@@ -79,9 +79,10 @@ jobs:
           echo "Sleeping 30s for BigQuery sandbox warm-up..."
           sleep 30
 
-      - name: Run market data ingestion (idempotent MERGE upsert)
+      - name: Run market data ingestion (idempotent BigQuery upsert)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY_PATH: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
           BIGQUERY_RAW_DATASET: ${{ env.BIGQUERY_RAW_DATASET }}
           BIGQUERY_ANALYTICS_DATASET: ${{ env.BIGQUERY_ANALYTICS_DATASET }}
           TICKERS: ${{ env.TICKERS }}
@@ -89,18 +90,22 @@ jobs:
         run: python -m src.ingestion.fetch_market_data
 
       - name: Run dbt transformations (staging → marts)
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY_PATH: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
         run: |
           dbt deps
           dbt run
           dbt test
         working-directory: dbt
 
-      - name: Run ML anomaly scoring + logging (MLflow + BigQuery MERGE)
+      - name: Run ML anomaly scoring + logging (MLflow + BigQuery upsert)
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY_PATH: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
           BIGQUERY_ANALYTICS_DATASET: ${{ env.BIGQUERY_ANALYTICS_DATASET }}
           BIGQUERY_ANOMALY_TABLE: ${{ env.BIGQUERY_ANOMALY_TABLE }}
-          MLFLOW_TRACKING_URI: sqlite:///mlruns
+          MLFLOW_TRACKING_URI: sqlite:///mlflow.db
           TICKERS: ${{ env.TICKERS }}
         run: python -m src.ml.detect_anomalies
 

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
 REQUIRED_CHECKS = ("env_project_id", "sa_key_file", "bq_connectivity")
 
@@ -45,12 +46,29 @@ def check_sa_key_file() -> tuple[bool, str]:
 
 def check_bq_connectivity() -> tuple[bool, str]:
     project_id = os.getenv("GCP_PROJECT_ID")
+    raw_path = os.getenv("GCP_SA_KEY_PATH")
     if not project_id:
         return False, "Skipping BQ connectivity check: GCP_PROJECT_ID not set"
+    if not raw_path:
+        return False, "Skipping BQ connectivity check: GCP_SA_KEY_PATH not set"
+    key_path = Path(raw_path)
+    if not key_path.exists():
+        return False, f"Skipping BQ connectivity check: key file not found at {key_path}"
     try:
-        client = bigquery.Client(project=project_id)
-        datasets = list(client.list_datasets())
-        return True, f"BigQuery connectivity OK (project={project_id}, datasets={[d.dataset_id for d in datasets]})"
+        # Authenticate explicitly with the service account key. Falling back to
+        # Application Default Credentials here would silently test the local
+        # gcloud user session instead of the credentials CI actually uses.
+        credentials = service_account.Credentials.from_service_account_file(
+            str(key_path),
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        client = bigquery.Client(project=project_id, credentials=credentials)
+        datasets = sorted(d.dataset_id for d in client.list_datasets())
+        tables = {
+            dataset_id: sorted(t.table_id for t in client.list_tables(f"{project_id}.{dataset_id}"))
+            for dataset_id in ("marketpulse_raw", "marketpulse_analytics")
+        }
+        return True, f"BigQuery connectivity OK (project={project_id}, datasets={datasets}, tables={tables})"
     except Exception as exc:  # noqa: BLE001 - smoke check must report, not crash
         return False, f"BigQuery connectivity check failed: {exc}"
 

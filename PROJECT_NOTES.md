@@ -38,16 +38,16 @@ GitHub Actions Cron (Mon 02:00 UTC)
 │  src/ingestion/      │────▶│  BigQuery        │────▶│  dbt (staging →   │
 │  fetch_market_data. │     │  marketpulse_   │     │  intermediate →    │
 │  (yfinance + BQ     │     │  raw             │     │  marts)            │
-│   MERGE upsert)      │     │  .market_ticks  │     │                     │
+│   DDL upsert)       │     │  .market_ticks  │     │                     │
 └─────────────────────┘     └──────────────────┘     └─────────────────────┘
                                                                  │
                                                                  ▼
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
 │  src/ml/             │────▶│  Gold tables in  │────▶│  fact_anomaly_      │
-│  detect_anomalies.  │     │  marketpulse_    │     │  scores (BQ MERGE)  │
-│  (IsolationForest,  │     │  analytics        │     │                     │
+│  detect_anomalies.  │     │  marketpulse_    │     │  scores (DDL        │
+│  (IsolationForest,  │     │  analytics        │     │  upsert)            │
 │   MLflow → SQLite,  │     │                  │     │                     │
-│   BQ MERGE)          │     └──────────────────┘     └─────────────────────┘
+│   BQ DDL upsert)     │     └──────────────────┘     └─────────────────────┘
 └─────────────────────┘              │
         │                          ▼
         ▼                   ┌─────────────────────┐
@@ -70,7 +70,10 @@ GitHub Actions Cron (Mon 02:00 UTC)
 
 ### 1.5 Key FAANG Design Decisions
 
-- **Idempotency:** BigQuery `MERGE` upserts keyed on `(ticker, trade_date)`; no duplicate rows.
+- **Idempotency:** BigQuery **DDL upserts** (`CREATE OR REPLACE TABLE ... AS SELECT` with
+  `ROW_NUMBER()` dedup) keyed on `(ticker, trade_date)`; no duplicate rows.
+  **BigQuery Sandbox rejects all DML**, so `MERGE`/`INSERT` are not usable at $0 — this was
+  confirmed against the live project (see §4).
 - **Feature store in dbt:** features computed inside SQL in `int_market_features` to prevent
   training-serving skew.
 - **Zero-cost constraints:** BigQuery Sandbox only, free-tier GitHub Actions, local SQLite MLflow,
@@ -102,8 +105,8 @@ GitHub Actions Cron (Mon 02:00 UTC)
 - [x] `src/utils/logger.py` — structured JSON logging via `logging.config.dictConfig`.
 - [x] `src/utils/alerts.py` — webhook alerting (Slack/Discord) + `check_risk_spike` high-risk trigger.
 - [x] `src/ingestion/fetch_market_data.py` — `yfinance` OHLCV fetch, `tenacity` exponential backoff,
-      idempotent BigQuery staging LOAD `WRITE_TRUNCATE` + `MERGE` upsert into raw.
-- [x] `tests/test_ingestion.py` — pytest suite (normalization, retries, dedup, MERGE upsert) — **8/8 PASSED**.
+      idempotent BigQuery staging LOAD `WRITE_TRUNCATE` + DDL upsert into raw.
+- [x] `tests/test_ingestion.py` — pytest suite (normalization, retries, dedup, DDL upsert) — **8/8 PASSED**.
 
 ### Phase 3 — dbt Medallion → Star Schema — ✅ COMPLETE
 - [x] `dbt_project.yml` — dbt project config (`marketpulse`, staging view / intermediate table / marts table).
@@ -119,7 +122,7 @@ GitHub Actions Cron (Mon 02:00 UTC)
 ### Phase 4 — ML, Dashboard, Docs — ✅ COMPLETE
 
 - [x] `src/ml/detect_anomalies.py` — IsolationForest (fit + score), MLflow (SQLite, params/metrics/model logging),
-      risk score normalization (0–100), idempotent MERGE into `fact_anomaly_scores`, high-risk webhook trigger (>85).
+      risk score normalization (0–100), idempotent DDL upsert into `fact_anomaly_scores`, high-risk webhook trigger (>85).
 - [x] `dashboard/app.py` — Streamlit + Plotly candlesticks, risk gauges, ticker filters, anomaly alerts feed.
 - [x] `README.md` — comprehensive setup instructions (GCP Sandbox, GitHub Secrets, Streamlit Cloud).
 - [x] Finalize `PROJECT_NOTES.md` — marking all build tasks complete.
@@ -127,7 +130,19 @@ GitHub Actions Cron (Mon 02:00 UTC)
 ### Phase 5 — Deployment & Operations — 🚧 IN PROGRESS
 
 - [x] `docs/DEPLOYMENT.md` — deployment runbook + post-deployment verification checklist + rollback notes.
-- [ ] Execute deployment verification checklist (GCP service account creation, BQ tables, secrets, first run).
+- [x] Local E2E verification run (2026-11-18) against project `marketpulse-demo`:
+  - [x] GCP auth: service-account key valid, BigQuery reachable (`scripts/check_gcp_credentials.py`).
+  - [x] Datasets/tables present: `marketpulse_raw.market_ticks`,
+        `marketpulse_analytics.{fact_daily_metrics, fact_anomaly_scores}`.
+  - [x] `dbt run` — 4/4 models built (staging view + intermediate/marts tables).
+  - [x] `dbt test` — 9/9 tests pass (incl. new singular grain-uniqueness test).
+  - [x] `python -m src.ingestion.fetch_market_data` — 180 rows upserted (6 tickers × 30 days).
+  - [x] `python -m src.ml.detect_anomalies` — 180 rows scored, 2 anomalies/ticker, MLflow run stored.
+  - [x] Dashboard renders (Streamlit `AppTest`: no exceptions, candlestick + gauge + tables).
+- [ ] Push verified changes to GitHub.
+- [ ] Configure GitHub Secrets (`GCP_PROJECT_ID`, `GCP_SA_KEY`, `ALERT_WEBHOOK_URL`).
+- [ ] Trigger first GitHub Actions run (`workflow_dispatch`) and confirm green.
+- [ ] Connect Streamlit Community Cloud app to `dashboard/app.py` (+ `gcp_service_account` secret).
 
 ---
 
@@ -139,7 +154,7 @@ Exact breakdown of files and features still left to build (as of Phase 4 complet
    - `src/utils/logger.py` — structured JSON logging via `logging.config.dictConfig`.
    - `src/utils/alerts.py` — Slack/Discord webhook alerting with severity levels.
    - `src/ingestion/fetch_market_data.py` — `yfinance` OHLCV fetch, `tenacity` exponential backoff,
-     idempotent BigQuery staging LOAD `WRITE_TRUNCATE` + `MERGE` upsert into `marketpulse_raw.market_ticks`.
+     idempotent BigQuery staging LOAD `WRITE_TRUNCATE` + DDL upsert into `marketpulse_raw.market_ticks`.
    - `tests/test_ingestion.py` — pytest suite with mocked `yfinance` + BigQuery client (**8/8 PASSED**).
 
 2. **Phase 3** — ✅ COMPLETE
@@ -151,41 +166,99 @@ Exact breakdown of files and features still left to build (as of Phase 4 complet
 
 3. **Phase 4** — ✅ COMPLETE
    - `src/ml/detect_anomalies.py` — IsolationForest, MLflow SQLite tracking, risk score 0–100,
-     `fact_anomaly_scores` MERGE, high-risk webhook trigger (>85).
+     `fact_anomaly_scores` DDL upsert, high-risk webhook trigger (>85).
    - `dashboard/app.py` — Streamlit + Plotly candlesticks, risk gauges, ticker filter, alerts feed.
    - `README.md` — GCP Sandbox setup, GitHub Secrets, Streamlit Cloud deployment.
    - Finalize `PROJECT_NOTES.md`.
 
 4. **Phase 5** — 🚧 IN PROGRESS
-   - `docs/DEPLOYMENT.md` — deployment runbook + verification checklist + rollback notes.
-   - Execute deployment verification checklist (service account, BQ tables, secrets, first run).
+   - [x] `docs/DEPLOYMENT.md` — deployment runbook + verification checklist + rollback notes.
+   - [x] Execute local deployment verification checklist (service account, BQ tables, dbt, ingest, score, dashboard).
+   - [ ] Push to GitHub and configure repository secrets.
+   - [ ] First scheduled/manual GitHub Actions run.
+   - [ ] Streamlit Cloud deployment.
 
 ---
 
 ## 4. Known Bugs, Edge Cases & Technical Debt
 
-- **BigQuery Sandbox DML quotas:** Free tier limits on long-running queries / partitions; consider
-  batching `MERGE` operations.
-- **yfinance rate limits / unauthenticated usage:** may throttle; mitigated by `tenacity` backoff.
-- **MLflow default tracking URI:** SQLite file per-run; must be set via `MLFLOW_TRACKING_URI`.
-- **DBT schema naming:** staging/ intermediate/ mart schemas under `marketpulse_analytics`.
-- **BigQuery `MERGE` for daily partitions:** date-partition overwrite strategy must be idempotent.
-- **dbt connection failure (`'NoneType' object has no attribute 'close'`):** caused by missing/invalid
-  GCP credentials. Valid SA key found at `D:\MarketPulse\secrets\marketpulse-sa.json` (project
-  `marketpulse-demo`) — must set `GCP_PROJECT_ID=marketpulse-demo` and `GCP_SA_KEY_PATH` in the same
-  shell session before running dbt commands. `git` binary missing locally causes an unrelated dbt check
-  failure (environmental). The failure persisted even with valid env wiring set (incl. `GOOGLE_APPLICATION_CREDENTIALS`),
-  indicating an environment-level auth/network constraint rather than local misconfiguration.
+### Resolved on 2026-11-18 (Phase 5 verification run)
+
+- **`dbt` connection failure (`'NoneType' object has no attribute 'close'`) — ROOT CAUSE FOUND.**
+  It was *not* an environment/auth problem. Two profile bugs in `dbt/profiles.yml`:
+  1. The service-account path was set via `service_account_file:`, which dbt-bigquery does not
+     recognise (`keyfile:` is the supported field). `credentials.keyfile` stayed `None`, producing
+     the misleading `'NoneType' object has no attribute 'close'` message.
+  2. `database:` was omitted, and dbt-bigquery then injects the **local ADC default project**
+     (`data-vault-pipeline`), which silently overrides `project_id`. Both are now set explicitly
+     to `env_var('GCP_PROJECT_ID')`.
+- **BigQuery Sandbox rejects all DML.** `MERGE` fails with
+  `403 ... DML queries are not allowed in the free tier`, so the original MERGE-based idempotency
+  design could never run at $0. Ingestion + ML upserts now use
+  `CREATE OR REPLACE TABLE ... AS SELECT` (DDL) with `ROW_NUMBER()` dedup and a staging-priority
+  rank. Verified working on the free tier.
+- **Stray/missing CTE fragments in dbt models.** `stg_market_ticks.sql` had a duplicate
+  `{{ source(...) }}` line that corrupted the compiled DDL, and `int_market_features.sql` was
+  missing its opening `WITH base AS (...)` block. Both fixed; `dbt run` now passes.
+- **Invalid dbt test config in `marts/schema.yml`.** Model-level `not_null` with a `columns:` list
+  and a `relationships` test without `column_name` both failed to compile. Replaced with per-column
+  `not_null` tests plus a singular grain test
+  (`dbt/tests/assert_fact_daily_metrics_grain_unique.sql`). Note: dbt's built-in `unique` test
+  does **not** accept a column list — it renders an invalid array literal.
+- **`yfinance` API drift.** `history(..., progress=False)` raises
+  `TypeError: PriceHistory.history() got an unexpected keyword argument 'progress'` on yfinance 1.8+.
+  Removed the argument.
+- **`_normalize_history` lost `trade_date`.** Columns were lowercased *before* `reset_index()`, so
+  the index name `Date` never matched and `trade_date` was missing. Lowercasing now happens after
+  the reset.
+- **MLflow URI wrote a file named `mlruns`.** `sqlite:///mlruns` created a SQLite *file* that then
+  blocked the artifact directory (`FileNotFoundError: ...\mlruns\0`). Standardised on
+  `sqlite:///mlflow.db` with artifacts in `mlruns/`.
+- **`client.query(query, params=...)` removed.** `google-cloud-bigquery` 3.x dropped `params`;
+  ingestion/ML/dashboard now pass `QueryJobConfig(query_parameters=[ScalarQueryParameter(...)])`.
+- **`alerts.py` logged with a string level.** `SEVERITY_TO_LOG_LEVEL` mapped to `"CRITICAL"` etc.,
+  so `logger.log()` raised `TypeError: level must be an integer`. Now maps to `logging.*` ints.
+- **`run_detection` referenced an undefined `resolved_table`.**
+- **Plotly gauge crash.** `go.Indicator(type="gauge", progressBar=...)` fails because `type` is
+  read-only; replaced with `mode="gauge+number"` + threshold marker.
+
+### Open
+
+- **Full-table rewrites:** the DDL upsert re-reads and rewrites the whole target table each run.
+  Fine at current volume (180 rows / 30-day window); revisit with partitioned overwrite
+  (`WRITE_TRUNCATE` on a partition decorator) if the history window grows.
+- **`yfinance` rate limits / unauthenticated usage:** may throttle; mitigated by `tenacity` backoff.
+- **`ALERT_WEBHOOK_URL` is empty locally**, so alert delivery no-ops by design.
+- **`dbt/.user.yml` and `.gitignore` were not tracked correctly** — `.gitignore` ignored itself and
+  `.user.yml` was committed. Both corrected (see working tree).
+- **Dashboard `use_container_width`** is deprecated in current Streamlit (`width='stretch'` is the
+  replacement); still functional, worth migrating.
+- **No `packages.yml`** — composite-uniqueness is handled by a singular test rather than
+  `dbt_utils.unique_combination_of_columns`, avoiding a package dependency.
 
 ---
 
 ## 5. Next Session Bootstrap Instructions
 
 1. Read this file (`PROJECT_NOTES.md`) first.
-2. Current phase: **Phase 5 — Deployment & Operations (in progress)**. Next: execute deployment verification checklist from `docs/DEPLOYMENT.md`.
-3. Respect the sequential one-phase-per-turn rule.
-4. At the end of every step, update this file (Completed/Remaining checklists, Known Bugs, Bootstrap).
+2. Current phase: **Phase 5 — Deployment & Operations (in progress)**. Local E2E verification is
+   **complete and green**; what remains is infrastructure wiring:
+   - Push the working tree to `origin/master`.
+   - Add GitHub Secrets: `GCP_PROJECT_ID`, `GCP_SA_KEY` (full SA JSON), `ALERT_WEBHOOK_URL`.
+   - Run the workflow once via `workflow_dispatch` and confirm it is green.
+   - Connect Streamlit Community Cloud to `dashboard/app.py` with a `gcp_service_account` secret.
+3. Local run recipe (env vars must be set in the same shell session):
+   ```powershell
+   Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object { $k,$v = $_ -split '=',2; Set-Item -Path "Env:$($k.Trim())" -Value $v.Trim() }
+   python scripts/check_gcp_credentials.py
+   python -m src.ingestion.fetch_market_data
+   cd dbt; dbt run --profiles-dir .; dbt test --profiles-dir .
+   cd ..; python -m src.ml.detect_anomalies
+   streamlit run dashboard/app.py
+   ```
+4. Respect the sequential one-phase-per-turn rule.
+5. At the end of every step, update this file (Completed/Remaining checklists, Known Bugs, Bootstrap).
 
 ---
 
-*Last updated: Phase 5 (deployment runbook created) — 2026-11-18*
+*Last updated: Phase 5 (local end-to-end verification passed; dbt/ingestion/ML/dashboard bugs fixed) — 2026-11-18*

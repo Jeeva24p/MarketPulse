@@ -16,6 +16,7 @@ import yfinance as yf
 from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
+from google.oauth2 import service_account
 
 from src.utils.logger import get_logger
 from src.utils.alerts import send_critical_alert
@@ -71,7 +72,7 @@ class MarketDataError(RuntimeError):
 )
 def _fetch_history_with_backoff(ticker: str, period: str) -> pd.DataFrame:
     """Fetch daily OHLCV bars via yfinance with exponential backoff retries."""
-    return yf.Ticker(ticker).history(period=period, interval="1d", progress=False)
+    return yf.Ticker(ticker).history(period=period, interval="1d")
 
 
 def _normalize_history(ticker: str, history: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -80,9 +81,10 @@ def _normalize_history(ticker: str, history: Optional[pd.DataFrame]) -> pd.DataF
         return pd.DataFrame(columns=RAW_COLUMNS)
 
     frame = history.copy()
-    frame.columns = [str(column).lower() for column in frame.columns]
-    if "date" not in frame.columns:
+    if "date" not in [str(column).lower() for column in frame.columns]:
         frame = frame.reset_index()
+    # Lowercase after reset_index so an index name like "Date" also normalizes.
+    frame.columns = [str(column).lower() for column in frame.columns]
     frame = frame.rename(
         columns={
             "date": "trade_date",
@@ -137,11 +139,46 @@ def fetch_market_data(
     return combined.reset_index(drop=True)
 
 
-def _build_merge_sql(project_id: str, dataset_id: str, table_id: str) -> str:
-    """Idempotent MERGE upsert: staging snapshot -> raw market ticks."""
+def _build_upsert_sql(project_id: str, dataset_id: str, table_id: str) -> str:
+    """Idempotent upsert via DDL: staging snapshot is merged by rewriting the table.
+
+    BigQuery's free Sandbox tier rejects all DML (``MERGE``/``INSERT``/``UPDATE``),
+    so the classic MERGE upsert cannot run at $0. ``CREATE OR REPLACE TABLE ...
+    AS SELECT`` is DDL and stays within the free tier: it re-reads the target,
+    unions the fresh staging batch, and keeps one row per (ticker, trade_date).
+    """
     return f"""
-MERGE `{project_id}.{dataset_id}.{table_id}` AS tgt
-USING (
+CREATE OR REPLACE TABLE `{project_id}.{dataset_id}.{table_id}`
+PARTITION BY trade_date
+CLUSTER BY ticker
+AS
+WITH combined AS (
+    SELECT
+        CAST(ticker AS STRING) AS ticker,
+        CAST(trade_date AS DATE) AS trade_date,
+        CAST(open_price AS FLOAT64) AS open_price,
+        CAST(high_price AS FLOAT64) AS high_price,
+        CAST(low_price AS FLOAT64) AS low_price,
+        CAST(close_price AS FLOAT64) AS close_price,
+        CAST(volume AS INT64) AS volume,
+        CAST(source AS STRING) AS source,
+        -- Staging rows win over what is already in the table.
+        0 AS source_rank
+    FROM `{project_id}.{dataset_id}.{STAGING_TABLE_NAME}`
+    UNION ALL
+    SELECT
+        CAST(ticker AS STRING) AS ticker,
+        CAST(trade_date AS DATE) AS trade_date,
+        CAST(open_price AS FLOAT64) AS open_price,
+        CAST(high_price AS FLOAT64) AS high_price,
+        CAST(low_price AS FLOAT64) AS low_price,
+        CAST(close_price AS FLOAT64) AS close_price,
+        CAST(volume AS INT64) AS volume,
+        CAST(source AS STRING) AS source,
+        1 AS source_rank
+    FROM `{project_id}.{dataset_id}.{table_id}`
+),
+deduplicated AS (
     SELECT
         ticker,
         trade_date,
@@ -150,19 +187,14 @@ USING (
         low_price,
         close_price,
         volume,
-        source
-    FROM `{project_id}.{dataset_id}.{STAGING_TABLE_NAME}`
-) AS src
-ON tgt.ticker = src.ticker
-   AND tgt.trade_date = src.trade_date
-WHEN MATCHED THEN UPDATE SET
-    open_price = src.open_price,
-    high_price = src.high_price,
-    low_price = src.low_price,
-    close_price = src.close_price,
-    volume = src.volume,
-    source = src.source
-WHEN NOT MATCHED THEN INSERT (
+        source,
+        ROW_NUMBER() OVER (
+            PARTITION BY ticker, trade_date
+            ORDER BY source_rank ASC, source DESC
+        ) AS row_num
+    FROM combined
+)
+SELECT
     ticker,
     trade_date,
     open_price,
@@ -171,17 +203,26 @@ WHEN NOT MATCHED THEN INSERT (
     close_price,
     volume,
     source
-) VALUES (
-    src.ticker,
-    src.trade_date,
-    src.open_price,
-    src.high_price,
-    src.low_price,
-    src.close_price,
-    src.volume,
-    src.source
-)
+FROM deduplicated
+WHERE row_num = 1
 """
+
+
+def _build_bq_client(project_id: str) -> bigquery.Client:
+    """Create a BigQuery client, preferring the configured service-account key.
+
+    Without this, the client falls back to Application Default Credentials, which
+    on a developer machine is usually a stale ``gcloud`` user session rather than
+    the credentials CI uses.
+    """
+    key_path = os.getenv("GCP_SA_KEY_PATH")
+    if key_path and os.path.exists(key_path):
+        credentials = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=["https://www.googleapis.com/auth/bigquery"],
+        )
+        return bigquery.Client(project=project_id, credentials=credentials)
+    return bigquery.Client(project=project_id)
 
 
 def _ensure_raw_table(client: bigquery.Client, table_id: str, schema: list[bigquery.SchemaField]) -> None:
@@ -203,7 +244,7 @@ def upsert_market_ticks(df: pd.DataFrame, project_id: Optional[str] = None) -> i
     target_full_table_id = f"{resolved_project}.{dataset_id}.{table_id}"
     staging_full_table_id = f"{resolved_project}.{dataset_id}.{STAGING_TABLE_NAME}"
 
-    client = bigquery.Client(project=resolved_project)
+    client = _build_bq_client(resolved_project)
     _ensure_raw_table(client=client, table_id=target_full_table_id, schema=RAW_TABLE_SCHEMA)
 
     if not df.empty:
@@ -212,13 +253,14 @@ def upsert_market_ticks(df: pd.DataFrame, project_id: Optional[str] = None) -> i
             staging_full_table_id,
             job_config=bigquery.LoadJobConfig(
                 write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                schema=RAW_TABLE_SCHEMA,
             ),
         )
         load_job.result()  # wait for load to complete
 
-    merge_job = client.query(_build_merge_sql(resolved_project, dataset_id, table_id))
+    merge_job = client.query(_build_upsert_sql(resolved_project, dataset_id, table_id))
     merge_job.result()
-    return int(merge_job.output_rows or 0)
+    return int(df.shape[0])
 
 
 def run_ingestion(

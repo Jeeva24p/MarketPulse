@@ -1,4 +1,14 @@
-{{ ref('stg_market_ticks') }}
+WITH base AS (
+    SELECT
+        ticker,
+        trade_date,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume
+    FROM {{ ref('stg_market_ticks') }}
+)
 
 , lagged AS (
     SELECT

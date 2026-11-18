@@ -10,7 +10,7 @@ This document is the authoritative guide for deploying and verifying the **Marke
 |---|---|---|
 | Ingestion + ML scoring + dbt | GitHub Actions (cron `0 2 * * 1`, manual dispatch) | GitHub-hosted runner |
 | Dashboard | Streamlit Cloud (free tier) or self-hosted | Streamlit |
-| MLflow tracking | Local SQLite (`mlruns/`) | Container / local |
+| MLflow tracking | Local SQLite (`mlflow.db`, artifacts in `mlruns/`) | Container / local |
 | BigQuery | BigQuery Sandbox (free tier) | GCP |
 
 ---
@@ -71,20 +71,26 @@ streamlit run dashboard/app.py
 
 ## 4. Post-Deployment Verification Checklist
 
-1. [ ] `dbt test` passes (staging/fact contracts: unique, not_null, relationships).
-2. [ ] `python -m src.ingestion.fetch_market_data` completes with rows upserted.
-3. [ ] `python -m src.ml.detect_anomalies` completes; MLflow run appears in SQLite store.
-4. [ ] `fact_anomaly_scores` has rows for the tickers in `TICKERS`.
-5. [ ] Dashboard renders candlesticks, gauge, and alerts feed.
-6. [ ] Critical risk spike alert fires webhook (risk > 85) or is properly skipped.
+Verified locally on 2026-11-18 against project `marketpulse-demo` (all items below passed).
 
----
+1. [x] `dbt test` passes (staging/fact contracts: unique, not_null, relationships + grain test).
+2. [x] `python -m src.ingestion.fetch_market_data` completes with rows upserted (180 rows / 6 tickers).
+3. [x] `python -m src.ml.detect_anomalies` completes; MLflow run appears in the SQLite store.
+4. [x] `fact_anomaly_scores` has rows for the tickers in `TICKERS` (180 rows, 2 anomalies/ticker).
+5. [x] Dashboard renders candlesticks, gauge, and alerts feed (Streamlit `AppTest`, no exceptions).
+6. [x] Critical risk spike alert path fires (risk > 85) or no-ops cleanly when no webhook is set.
+
+> **Sandbox note:** BigQuery's free tier rejects all DML (`MERGE`/`INSERT`/`UPDATE`). Both the
+> ingestion and ML write-backs use `CREATE OR REPLACE TABLE ... AS SELECT` with `ROW_NUMBER()`
+> dedup, which is DDL and allowed on the free tier.
 
 ## 5. Rollback & Operations
 
 - Re-run dbt steps to rebuild gold tables: `dbt run --full-refresh`
-- Delete/recreate staging + MERGE again (idempotent design supports safe re-runs).
-- MLflow runs append-only; SQLite store can be reset via `MLFLOW_TRACKING_URI=sqlite:///<path>`.
+- Re-run ingestion to rebuild the raw table: the DDL upsert re-reads the target, unions the fresh
+  staging batch, and keeps one row per `(ticker, trade_date)` — safe to repeat.
+- MLflow runs append-only; the SQLite store can be reset by deleting `mlflow.db` (artifacts in
+  `mlruns/`).
 - Alerting: if `ALERT_WEBHOOK_URL` is empty, alerts no-op (by design).
 
 ---
